@@ -1,0 +1,31 @@
+how_everything_done.md
+pretraining.csv
+
+# Python cache / bytecode
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
+
+# Build metadata
+build/
+dist/
+*.egg-info/
+
+# Training / inference artifacts
+*.lmdb
+*.pth
+result/
+results/
+outputs/
+checkpoints/
