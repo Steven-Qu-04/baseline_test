@@ -35,6 +35,7 @@ class GraphTransformerLayer(nn.Module):
     def forward(self, x: torch.Tensor, key_padding_mask: torch.Tensor, attn_bias: torch.Tensor) -> torch.Tensor:
         float_padding_mask = torch.zeros_like(key_padding_mask, dtype=x.dtype)
         float_padding_mask = float_padding_mask.masked_fill(key_padding_mask, float("-inf"))
+        float_padding_mask = float_padding_mask.to(attn_bias.dtype)
         attn_out, _ = self.attn(
             x,
             x,
@@ -108,7 +109,7 @@ class MolecularGTN(nn.Module):
         attn_bias = attn_bias.reshape(batch_size * num_heads, num_nodes, num_nodes)
         return attn_bias
 
-    def encode(self, batch: Batch) -> EncoderOutput:
+    def encode(self, batch: Batch, compute_bond_embeddings: bool = True) -> EncoderOutput:
         x = torch.cat([batch.x, batch.lap_pe], dim=-1)
         dense_x, dense_mask = to_dense_batch(x, batch.batch)
         node_mask = ~dense_mask
@@ -121,7 +122,9 @@ class MolecularGTN(nn.Module):
         flat_hidden = hidden[dense_mask]
         edge_src = batch.edge_index[0]
         edge_dst = batch.edge_index[1]
-        if batch.edge_attr.size(0) == 0:
+        if not compute_bond_embeddings:
+            bond_embeddings = batch.edge_attr.new_zeros((0, self.config.hidden_dim))
+        elif batch.edge_attr.size(0) == 0:
             bond_embeddings = batch.edge_attr.new_zeros((0, self.config.hidden_dim))
         else:
             bond_inputs = torch.cat([flat_hidden[edge_src], flat_hidden[edge_dst], batch.edge_attr], dim=-1)
@@ -133,7 +136,6 @@ class MolecularGTN(nn.Module):
             node_mask=node_mask,
         )
 
-    def forward(self, batch: Batch) -> tuple[EncoderOutput, torch.Tensor]:
-        encoded = self.encode(batch)
-        projected = self.projector(encoded.mol_embeddings)
-        return encoded, projected
+    def forward(self, batch: Batch) -> torch.Tensor:
+        encoded = self.encode(batch, compute_bond_embeddings=False)
+        return self.projector(encoded.mol_embeddings)

@@ -390,7 +390,16 @@ Gradient Accumulation 的做法是：
 - 日志与输出路径统一
 - batch 级别正负样本构造清晰
 
-目前还**没有真正实现 DDP 训练**，但代码组织方式已经方便后续扩展。
+现在已经不只是“预留接口”，而是已经完成了基础 DDP 改造：
+
+- 支持 `torchrun` 多进程启动
+- 支持 `DistributedSampler`
+- 支持分布式 NT-Xent
+- 支持 medium LMDB 压力测试
+- 支持 4 卡 autotune 与 stress test
+- 支持全量训练完成后自动打包、上传 OSS、并关机
+
+不过，当前仍需持续关注长时间训练时的 NCCL 稳定性。
 
 ---
 
@@ -418,6 +427,9 @@ Gradient Accumulation 的做法是：
 │       └── runtime.py
 ├── pretraining.csv
 ├── 分子信息汇总.md
+├── check_platform.py
+├── distributed_run.sh
+├── final_fullscale_run.sh
 ├── run_full_pipeline.sh
 ├── setup_env.sh
 ├── smoke_test.sh
@@ -467,8 +479,9 @@ Gradient Accumulation 的做法是：
 负责预处理主流程：
 
 - 读取 CSV
-- 多进程处理分子
-- Producer 把样本放进 Queue
+- task feeder 投喂任务
+- 多个长期运行的 producer workers 处理分子
+- Producer 把样本放进有界 Queue
 - Consumer 单独写 LMDB
 
 这是数据准备阶段最关键的文件之一。
@@ -500,7 +513,10 @@ Gradient Accumulation 的做法是：
 
 ### `mol_gtn/losses.py`
 
-定义 NT-Xent loss。
+定义 NT-Xent loss，包括：
+
+- 单机版 NT-Xent
+- 分布式 NT-Xent（支持跨卡 negatives）
 
 ### `mol_gtn/train.py`
 
@@ -511,6 +527,9 @@ Gradient Accumulation 的做法是：
 - loss 计算
 - AMP
 - gradient accumulation
+- DDP 初始化
+- distributed sampler
+- autotune
 - 保存最优权重
 
 ### `mol_gtn/infer.py`
@@ -520,6 +539,29 @@ Gradient Accumulation 的做法是：
 ### `mol_gtn/check_env.py`
 
 用于检查环境是否安装正确。
+
+### `check_platform.py`
+
+用于检查当前机器是否适合 DDP：
+
+- GPU 数量
+- CPU 数量
+- NCCL 可用性
+- GPU 拓扑
+- P2P 可访问性
+- NVLink 是否存在
+
+### `final_fullscale_run.sh`
+
+这是当前项目面向 4 卡 A100 的最终生产入口脚本。
+
+默认会按顺序执行：
+
+- 平台检查
+- 全量预处理（或复用现有 LMDB）
+- medium DDP stress test
+- 全量 4 卡分布式训练
+- 可选：训练完成后自动上传结果并关机
 
 ### `mol_gtn/utils/logging.py`
 
@@ -595,6 +637,29 @@ python -m mol_gtn.check_env --output-dir /hy-tmp/result
 ./run_full_pipeline.sh
 ```
 
+### 13.5 第五步：跑 4 卡 DDP 全量流程
+
+如果你已经完成 medium LMDB 验证，并要开始正式 4 卡训练，推荐使用：
+
+```bash
+./final_fullscale_run.sh
+```
+
+如果你已经有全量 LMDB，跳过预处理：
+
+```bash
+SKIP_PREPROCESS=1 ./final_fullscale_run.sh
+```
+
+如果你希望训练完成后自动上传结果并关机：
+
+```bash
+SKIP_PREPROCESS=1 \
+AUTO_UPLOAD_AND_SHUTDOWN=1 \
+OSS_TARGET_DIR=oss://backup/ \
+./final_fullscale_run.sh
+```
+
 ---
 
 ## 14. Shell 脚本说明
@@ -631,6 +696,23 @@ python -m mol_gtn.check_env --output-dir /hy-tmp/result
   - 推理
 
 这是生产入口脚本。
+
+### `final_fullscale_run.sh`
+
+这是当前 4 卡 DDP 的全量生产版脚本。
+
+默认使用当前已经验证过的最终推荐配置：
+
+- `batch_per_gpu=32`
+- `grad_accum_steps=2`
+- `scaled_learning_rate=0.0003`
+
+并附带：
+
+- 随机 `MASTER_PORT`
+- NCCL 运行时保护变量
+- medium stress test
+- 训练完成后 OSS 上传与自动关机钩子
 
 ---
 
@@ -712,6 +794,10 @@ CPU_WORKERS=48 \
   - 当前最佳模型权重
 - `top10_embeddings.csv`
   - 推理导出的前 10 个分子向量
+- `platform_summary.json`
+  - 当前机器硬件与拓扑摘要
+- `autotune_*.json`
+  - autotune 结果记录
 
 ---
 
@@ -750,6 +836,29 @@ CPU_WORKERS=48 \
 
 - 终端进度条
 - 持久日志文件
+
+### 17.7 DDP + Cross-GPU Negatives
+
+当前训练已经支持：
+
+- 4 卡 DDP
+- 跨卡聚合 embedding
+- 扩大 contrastive negatives 池
+
+这使得每张卡可以同时利用其他 3 张卡上的样本作为 negatives。
+
+### 17.8 全量训练后的自动回收
+
+当前项目已经支持：
+
+- 将 `/hy-tmp/result` 压缩成 zip
+- 上传到 `oss://backup/`
+- 上传成功后自动关机
+
+相关脚本：
+
+- `/root/upload.sh`
+- `final_fullscale_run.sh`
 
 ---
 
@@ -796,6 +905,24 @@ LMDB 只存：
 
 增强是在训练时动态生成的。
 
+### Q6：为什么 autotune 的推荐值不一定就是最终生产参数？
+
+因为 autotune 更偏向回答：
+
+- “这个 batch 能不能跑？”
+- “显存还剩多少？”
+
+但最终生产训练还需要考虑：
+
+- NCCL 长时间稳定性
+- 多 epoch 训练的通信负载
+- PCIe 多卡机器上的实际运行风险
+
+所以最终参数通常是：
+
+- 参考 autotune
+- 再结合 stress test 和多 epoch 实测结果做收敛
+
 ---
 
 ## 19. 当前实现的已知简化
@@ -804,7 +931,7 @@ LMDB 只存：
 
 - 目前不做 3D 构象生成
 - 当前 mask 是“特征置零”风格，不是更复杂的化学规则增强
-- 当前 DDP 只是结构上预留，并未完整实现
+- 当前 DDP 已经实现并可运行，但长时间训练下仍需继续优化 NCCL 稳定性
 - `padding_mask` 的实际主要作用体现在批内 dense padding 节点屏蔽
 
 这些都不影响项目作为一个完整可运行的预训练基线。
@@ -817,7 +944,7 @@ LMDB 只存：
 
 - 增加更丰富的化学增强策略
 - 增加验证集与更稳定的 checkpoint 选择标准
-- 支持真正的 DDP 多卡训练
+- 继续优化 DDP 结束时的 NCCL 清理与同步逻辑
 - 加入下游任务微调脚本
 - 加入 TensorBoard / WandB 等实验追踪
 - 增加单元测试和回归测试
@@ -851,6 +978,26 @@ EPOCHS=10 \
 ./run_full_pipeline.sh
 ```
 
+### 4 卡全量训练
+
+```bash
+SKIP_PREPROCESS=1 \
+BATCH_PER_GPU=32 \
+GRAD_ACCUM_STEPS=2 \
+SCALED_LEARNING_RATE=0.0003 \
+EPOCHS=20 \
+./final_fullscale_run.sh
+```
+
+### 训练完成后自动上传并关机
+
+```bash
+SKIP_PREPROCESS=1 \
+AUTO_UPLOAD_AND_SHUTDOWN=1 \
+OSS_TARGET_DIR=oss://backup/ \
+./final_fullscale_run.sh
+```
+
 ### 查看结果
 
 ```bash
@@ -863,6 +1010,7 @@ tail -n 50 /hy-tmp/result/project.log
 ## 22. 关键文件速查
 
 - 项目配置：`mol_gtn/config.py:8`
+- 平台检查：`check_platform.py:43`
 - 特征工程：`mol_gtn/features.py:85`
 - LapPE：`mol_gtn/lap_pe.py:7`
 - 预处理主流程：`mol_gtn/preprocess.py:106`
@@ -874,6 +1022,7 @@ tail -n 50 /hy-tmp/result/project.log
 - 推理入口：`mol_gtn/infer.py:19`
 - 环境检查：`mol_gtn/check_env.py:13`
 - 全流程脚本：`run_full_pipeline.sh:1`
+- DDP 全量脚本：`final_fullscale_run.sh:1`
 
 ---
 
@@ -884,6 +1033,19 @@ tail -n 50 /hy-tmp/result/project.log
 - 把大规模分子预处理和训练流程真正串起来
 - 兼顾工程稳定性和研究扩展性
 - 让新手也能从 `setup_env.sh` 到 `smoke_test.sh` 一路跑通
+- 并进一步扩展到 4 卡 A100 的 DDP、autotune、stress test、OSS 结果回收与自动关机
+
+### 最新验证结果摘要
+
+- CPU smoke preprocess：已通过
+- `50000` 分子 medium LMDB：已生成并验证成功
+- 4 卡 DDP autotune：已通过
+- 保守 4 卡训练：已通过
+- `batch_per_gpu=32`, `grad_accum_steps=2`, `lr=3e-4`：已完成多 epoch 验证，loss 明显下降
+- 当前全量训练默认建议配置：
+  - `batch_per_gpu=32`
+  - `grad_accum_steps=2`
+  - `scaled_learning_rate=0.0003`
 
 如果你是新手，推荐顺序是：
 

@@ -24,8 +24,17 @@ dist/
 
 # Training / inference artifacts
 *.lmdb
+*.lmdb-lock
 *.pth
+*.zip
+*.json
 result/
 results/
 outputs/
 checkpoints/
+
+# External runtime workspace
+/hy-tmp/
+
+# Misc runtime files
+nohup.out

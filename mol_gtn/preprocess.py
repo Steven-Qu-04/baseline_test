@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import multiprocessing as mp
+import os
+import time
 from dataclasses import replace
 from pathlib import Path
 from queue import Empty
-from typing import Iterable
 
-import pandas as pd
 import torch
 from rdkit import Chem
 from torch_geometric.data import Data
@@ -21,10 +22,11 @@ from .utils.logging import attach_queue_logger, build_queue_logging, configure_l
 from .utils.runtime import seed_everything
 
 
-SENTINEL = "__QUEUE_DONE__"
+TASK_SENTINEL = "__TASK_DONE__"
+RESULT_SENTINEL = "__RESULT_DONE__"
 
 
-def build_data_object(row: dict, config: PipelineConfig) -> Data | None:
+def build_data_object(row: dict, config: PipelineConfig) -> Data:
     smiles = row["smiles"]
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
@@ -34,7 +36,7 @@ def build_data_object(row: dict, config: PipelineConfig) -> Data | None:
     edge_index, edge_attr = bond_features_and_index(mol)
     validate_feature_dimensions(x, edge_attr)
     lap_pe, lap_pe_valid_mask = compute_laplacian_positional_encoding(mol.GetNumAtoms(), edge_index, config.lap_pe_dim)
-    data = Data(
+    return Data(
         x=x,
         edge_index=edge_index,
         edge_attr=edge_attr,
@@ -46,38 +48,89 @@ def build_data_object(row: dict, config: PipelineConfig) -> Data | None:
         source_line=int(row.get("source_line", -1)),
         molecule_id=f"{row.get('source_file', 'unknown')}:{row.get('source_line', -1)}",
     )
-    return data
 
 
-def producer(rows: list[dict], queue: mp.Queue, config: PipelineConfig, log_queue: mp.Queue | None) -> None:
+def safe_qsize(queue: mp.Queue) -> int:
+    try:
+        return queue.qsize()
+    except (NotImplementedError, AttributeError):
+        return -1
+
+
+def task_feeder(
+    csv_path: str,
+    task_queue: mp.Queue,
+    worker_count: int,
+    row_limit: int | None,
+    log_queue: mp.Queue | None,
+) -> None:
     logger = attach_queue_logger(log_queue)
-    for row in rows:
+    submitted = 0
+    with open(csv_path, newline="") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            if row_limit is not None and submitted >= row_limit:
+                break
+            task_queue.put(row)
+            submitted += 1
+            if submitted % 5000 == 0:
+                logger.info("Task feeder submitted %s rows (task_queue_size=%s)", submitted, safe_qsize(task_queue))
+    for _ in range(worker_count):
+        task_queue.put(TASK_SENTINEL)
+    logger.info("Task feeder finished after submitting %s rows", submitted)
+
+
+def producer_worker(
+    task_queue: mp.Queue,
+    result_queue: mp.Queue,
+    config: PipelineConfig,
+    log_queue: mp.Queue | None,
+) -> None:
+    logger = attach_queue_logger(log_queue)
+    processed = 0
+    while True:
+        item = task_queue.get()
+        if item == TASK_SENTINEL:
+            result_queue.put((RESULT_SENTINEL, None))
+            logger.info("Producer exiting after %s processed rows", processed)
+            return
         try:
-            data = build_data_object(row, config)
-            if data is None:
-                continue
-            queue.put(("data", data.molecule_id, serialize_data(data)))
+            data = build_data_object(item, config)
+            result_queue.put(("data", serialize_data(data)))
+            processed += 1
         except Exception as exc:
-            logger.warning("Skipping invalid sample smiles=%s source=%s:%s reason=%s", row.get("smiles"), row.get("source_file"), row.get("source_line"), exc)
-            queue.put(("invalid", None, None))
-    queue.put((SENTINEL, None, None))
+            logger.warning(
+                "Skipping invalid sample smiles=%s source=%s:%s reason=%s",
+                item.get("smiles"),
+                item.get("source_file"),
+                item.get("source_line"),
+                exc,
+            )
+            result_queue.put(("invalid", None))
 
 
-def consumer(queue: mp.Queue, lmdb_path: str, num_producers: int, batch_size: int, log_queue: mp.Queue | None) -> None:
+def consumer_writer(
+    result_queue: mp.Queue,
+    lmdb_path: str,
+    worker_count: int,
+    batch_size: int,
+    log_queue: mp.Queue | None,
+) -> None:
     logger = attach_queue_logger(log_queue)
     ensure_output_dir(str(Path(lmdb_path).parent))
     env = open_lmdb(lmdb_path, readonly=False)
-    done = 0
+    txn = env.begin(write=True)
     index = 0
     invalid = 0
-    txn = env.begin(write=True)
-    while done < num_producers:
+    completed_workers = 0
+    last_log_time = time.time()
+    while completed_workers < worker_count:
         try:
-            message_type, key, payload = queue.get(timeout=5)
+            message_type, payload = result_queue.get(timeout=5)
         except Empty:
             continue
-        if message_type == SENTINEL:
-            done += 1
+        if message_type == RESULT_SENTINEL:
+            completed_workers += 1
             continue
         if message_type == "invalid":
             invalid += 1
@@ -89,6 +142,14 @@ def consumer(queue: mp.Queue, lmdb_path: str, num_producers: int, batch_size: in
             txn.put(b"invalid_count", str(invalid).encode())
             txn.commit()
             txn = env.begin(write=True)
+        if time.time() - last_log_time >= 10:
+            logger.info(
+                "LMDB writer progress entries=%s invalid=%s result_queue_size=%s",
+                index,
+                invalid,
+                safe_qsize(result_queue),
+            )
+            last_log_time = time.time()
     txn.put(b"length", str(index).encode())
     txn.put(b"invalid_count", str(invalid).encode())
     txn.commit()
@@ -97,10 +158,10 @@ def consumer(queue: mp.Queue, lmdb_path: str, num_producers: int, batch_size: in
     logger.info("LMDB write complete at %s with %s entries and %s invalid rows", lmdb_path, index, invalid)
 
 
-def chunk_rows(rows: list[dict], num_chunks: int) -> Iterable[list[dict]]:
-    chunk_size = max(1, (len(rows) + num_chunks - 1) // num_chunks)
-    for start in range(0, len(rows), chunk_size):
-        yield rows[start : start + chunk_size]
+def verify_exitcodes(processes: list[mp.Process], label: str) -> None:
+    failed = [process.name for process in processes if process.exitcode not in (0, None)]
+    if failed:
+        raise RuntimeError(f"{label} failed: {failed}")
 
 
 def run_preprocess(config: PipelineConfig) -> None:
@@ -108,36 +169,63 @@ def run_preprocess(config: PipelineConfig) -> None:
     logger = configure_logging(config.log_path)
     output_dir = config.resolved_output_dir()
     output_dir.mkdir(parents=True, exist_ok=True)
-    df = pd.read_csv(config.csv_path)
-    if config.smoke_test:
-        df = df.head(config.smoke_rows)
-    rows = df.to_dict("records")
     lmdb_path = config.active_lmdb_path()
+    row_limit = config.active_row_limit()
     if Path(lmdb_path).exists():
         Path(lmdb_path).unlink()
+
+    worker_count = config.detected_preprocess_worker_count()
+    task_queue_size = config.resolved_task_queue_maxsize()
+    result_queue_size = config.resolved_result_queue_maxsize()
+    logger.info(
+        "Starting preprocess lmdb=%s worker_count=%s task_queue_maxsize=%s result_queue_maxsize=%s row_limit=%s",
+        lmdb_path,
+        worker_count,
+        task_queue_size,
+        result_queue_size,
+        row_limit if row_limit is not None else "full",
+    )
+
     log_queue, listener = build_queue_logging(config.log_path)
-    queue: mp.Queue = mp.Queue(maxsize=config.queue_size)
-    producers = []
-    worker_count = min(config.num_workers, max(1, len(rows)))
-    consumer_process = mp.Process(
-        target=consumer,
-        args=(queue, lmdb_path, worker_count, config.writer_batch_size, log_queue),
+    context = mp.get_context("spawn")
+    task_queue = context.Queue(maxsize=task_queue_size)
+    result_queue = context.Queue(maxsize=result_queue_size)
+
+    feeder = context.Process(
+        target=task_feeder,
+        args=(config.csv_path, task_queue, worker_count, row_limit, log_queue),
+        name="task-feeder",
+    )
+    consumer = context.Process(
+        target=consumer_writer,
+        args=(result_queue, lmdb_path, worker_count, config.writer_batch_size, log_queue),
         name="lmdb-consumer",
     )
-    consumer_process.start()
-    for idx, batch in enumerate(chunk_rows(rows, worker_count)):
-        process = mp.Process(
-            target=producer,
-            args=(batch, queue, config, log_queue),
+    workers = [
+        context.Process(
+            target=producer_worker,
+            args=(task_queue, result_queue, config, log_queue),
             name=f"producer-{idx}",
         )
-        producers.append(process)
-        process.start()
-    for process in tqdm(producers, desc="preprocess-workers"):
-        process.join()
-    consumer_process.join()
+        for idx in range(worker_count)
+    ]
+
+    start_time = time.time()
+    consumer.start()
+    feeder.start()
+    for worker in workers:
+        worker.start()
+
+    for worker in tqdm(workers, desc="preprocess-workers"):
+        worker.join()
+    feeder.join()
+    consumer.join()
     listener.stop()
-    logger.info("Preprocessing finished. LMDB=%s rows=%s", lmdb_path, len(rows))
+
+    verify_exitcodes([feeder], "Task feeder")
+    verify_exitcodes(workers, "Producer workers")
+    verify_exitcodes([consumer], "LMDB consumer")
+    logger.info("Preprocessing finished. LMDB=%s elapsed_sec=%.2f", lmdb_path, time.time() - start_time)
 
 
 def parse_args() -> argparse.Namespace:
@@ -145,13 +233,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--csv", dest="csv_path", default="pretraining.csv")
     parser.add_argument("--lmdb", dest="lmdb_path", default="/hy-tmp/result/pretraining.lmdb")
     parser.add_argument("--smoke-lmdb", dest="smoke_lmdb_path", default="/hy-tmp/result/smoke_pretraining.lmdb")
+    parser.add_argument("--medium-lmdb", dest="medium_lmdb_path", default="/hy-tmp/result/ddp_medium_50k.lmdb")
     parser.add_argument("--output-dir", default="/hy-tmp/result")
-    parser.add_argument("--workers", dest="num_workers", type=int, default=8)
-    parser.add_argument("--queue-size", type=int, default=256)
+    parser.add_argument("--workers", dest="preprocess_worker_count", type=int, default=0)
+    parser.add_argument("--cpu-reserve-threads", type=int, default=4)
+    parser.add_argument("--task-queue-maxsize", type=int, default=0)
+    parser.add_argument("--result-queue-maxsize", type=int, default=0)
     parser.add_argument("--writer-batch-size", type=int, default=64)
     parser.add_argument("--lap-pe-dim", type=int, default=8)
     parser.add_argument("--smoke-test", action="store_true")
     parser.add_argument("--smoke-rows", type=int, default=100)
+    parser.add_argument("--medium-test", action="store_true")
+    parser.add_argument("--medium-rows", type=int, default=50000)
     return parser.parse_args()
 
 
