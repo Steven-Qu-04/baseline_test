@@ -17,15 +17,31 @@ def nt_xent_loss(anchor_z: torch.Tensor, positive_z: torch.Tensor, temperature: 
     return F.cross_entropy(similarity, targets)
 
 
-def _gather_with_local_grad(tensor: torch.Tensor) -> torch.Tensor:
+def _all_gather_batch_sizes(local_size: int, device: torch.device) -> list[int]:
+    size_tensor = torch.tensor([local_size], device=device, dtype=torch.long)
+    gathered_sizes = [torch.zeros_like(size_tensor) for _ in range(dist.get_world_size())]
+    dist.all_gather(gathered_sizes, size_tensor)
+    return [int(size.item()) for size in gathered_sizes]
+
+
+def _gather_with_local_grad(tensor: torch.Tensor, batch_sizes: list[int]) -> torch.Tensor:
     if not dist.is_available() or not dist.is_initialized():
         return tensor
     world_size = dist.get_world_size()
     rank = dist.get_rank()
-    gathered = [torch.zeros_like(tensor) for _ in range(world_size)]
-    dist.all_gather(gathered, tensor.detach())
-    gathered[rank] = tensor
-    return torch.cat(gathered, dim=0)
+    local_size = tensor.size(0)
+    max_size = max(batch_sizes) if batch_sizes else local_size
+    if local_size < max_size:
+        pad_shape = (max_size - local_size, *tensor.shape[1:])
+        pad = torch.zeros(pad_shape, device=tensor.device, dtype=tensor.dtype)
+        padded = torch.cat([tensor, pad], dim=0)
+    else:
+        padded = tensor
+    gathered = [torch.zeros_like(padded) for _ in range(world_size)]
+    dist.all_gather(gathered, padded.detach())
+    gathered[rank] = padded
+    slices = [chunk[:size] for chunk, size in zip(gathered, batch_sizes)]
+    return torch.cat(slices, dim=0)
 
 
 def distributed_nt_xent_loss(anchor_z: torch.Tensor, positive_z: torch.Tensor, temperature: float) -> torch.Tensor:
@@ -34,14 +50,15 @@ def distributed_nt_xent_loss(anchor_z: torch.Tensor, positive_z: torch.Tensor, t
 
     anchor_z = F.normalize(anchor_z, dim=-1)
     positive_z = F.normalize(positive_z, dim=-1)
-    global_anchor = _gather_with_local_grad(anchor_z)
-    global_positive = _gather_with_local_grad(positive_z)
+    batch_sizes = _all_gather_batch_sizes(anchor_z.size(0), anchor_z.device)
+    global_anchor = _gather_with_local_grad(anchor_z, batch_sizes)
+    global_positive = _gather_with_local_grad(positive_z, batch_sizes)
     global_repr = torch.cat([global_anchor, global_positive], dim=0)
 
     local_batch_size = anchor_z.size(0)
     global_batch_size = global_anchor.size(0)
     rank = dist.get_rank()
-    start = rank * local_batch_size
+    start = sum(batch_sizes[:rank])
     local_indices = torch.arange(local_batch_size, device=anchor_z.device)
 
     anchor_logits = torch.matmul(anchor_z, global_repr.T) / temperature

@@ -4,6 +4,7 @@ pretraining.csv
 # Python cache / bytecode
 __pycache__/
 *.py[cod]
+*.pyo
 
 # Virtual environments
 .venv/
@@ -27,14 +28,26 @@ dist/
 *.lmdb-lock
 *.pth
 *.zip
-*.json
 result/
 results/
 outputs/
 checkpoints/
+downstream_runs/
+downstream_runs_mlp_twostage/
+interpretability_results/
 
 # External runtime workspace
 /hy-tmp/
 
 # Misc runtime files
 nohup.out
+*.log
+*.tmp
+
+# Local datasets and large generated files
+/datasets/pretraining.csv
+/datasets/*.tar.gz
+/loss_line_chart.png
+/pretraining_1m.csv
+/visualize_importance.pyc
+datasets/Lipophilicity

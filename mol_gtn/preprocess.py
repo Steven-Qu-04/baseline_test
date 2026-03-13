@@ -14,6 +14,7 @@ from rdkit import Chem
 from torch_geometric.data import Data
 from tqdm import tqdm
 
+from .augment import build_anchor_view, build_diverse_views
 from .config import PipelineConfig
 from .features import atom_features, bond_features_and_index, validate_feature_dimensions
 from .lap_pe import compute_laplacian_positional_encoding
@@ -36,7 +37,7 @@ def build_data_object(row: dict, config: PipelineConfig) -> Data:
     edge_index, edge_attr = bond_features_and_index(mol)
     validate_feature_dimensions(x, edge_attr)
     lap_pe, lap_pe_valid_mask = compute_laplacian_positional_encoding(mol.GetNumAtoms(), edge_index, config.lap_pe_dim)
-    return Data(
+    data = Data(
         x=x,
         edge_index=edge_index,
         edge_attr=edge_attr,
@@ -48,6 +49,16 @@ def build_data_object(row: dict, config: PipelineConfig) -> Data:
         source_line=int(row.get("source_line", -1)),
         molecule_id=f"{row.get('source_file', 'unknown')}:{row.get('source_line', -1)}",
     )
+    if config.data_mode == "offline":
+        anchor = build_anchor_view(data, mask_ratio=0.05)
+        positives = build_diverse_views(
+            data,
+            num_views=config.active_num_masked_views(),
+            total_mask_ratio=0.2,
+        )
+        data.offline_anchor = anchor
+        data.offline_positives = positives
+    return data
 
 
 def safe_qsize(queue: mp.Queue) -> int:
@@ -241,6 +252,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--result-queue-maxsize", type=int, default=0)
     parser.add_argument("--writer-batch-size", type=int, default=64)
     parser.add_argument("--lap-pe-dim", type=int, default=8)
+    parser.add_argument("--data-mode", choices=["auto", "offline", "online"], default="online")
     parser.add_argument("--smoke-test", action="store_true")
     parser.add_argument("--smoke-rows", type=int, default=100)
     parser.add_argument("--medium-test", action="store_true")

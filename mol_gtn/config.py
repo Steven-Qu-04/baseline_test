@@ -30,6 +30,7 @@ class PipelineConfig:
     projection_dim: int = 128
     temperature: float = 0.07
     batch_size: int = 8
+    max_nodes_per_batch: int = 0
     grad_accum_steps: int = 4
     learning_rate: float = 1e-4
     weight_decay: float = 1e-5
@@ -54,6 +55,11 @@ class PipelineConfig:
     stress_steps: int = 1000
     max_steps: int = 0
     skip_save: bool = False
+    resume_from: str = ""
+    run_timestamp: str = ""
+    data_mode: str = "auto"
+    loss_log_every_steps: int = 10
+    loss_flush_every_steps: int = 100
     autotune_enabled: bool = False
     autotune_batch_min: int = 2
     autotune_batch_max: int = 64

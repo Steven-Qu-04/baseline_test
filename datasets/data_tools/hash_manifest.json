@@ -1,0 +1,40 @@
+{
+  "algorithm": "sha256",
+  "created_at_utc": "2026-02-11T05:34:35.919109+00:00",
+  "project_root": "/root/Protein-Ligand-Framework",
+  "datasets_root": "/root/Protein-Ligand-Framework/datasets",
+  "mode": "main",
+  "included_main_csv_names": [
+    "Lipophilicity.csv",
+    "muv.csv",
+    "pcba.csv",
+    "toxcast_data.csv"
+  ],
+  "file_count": 4,
+  "files": [
+    {
+      "relpath_from_datasets": "Lipophilicity/Lipophilicity.csv",
+      "sha256": "aed41590cb30609d51d8e08ad3ff06495a76e80e211358801f596b10da69bacd",
+      "bytes": 282606,
+      "mtime_utc": "2026-02-11T04:54:07.574213+00:00"
+    },
+    {
+      "relpath_from_datasets": "muv/muv.csv",
+      "sha256": "efcde86d98393c6537052c70c67ed121f454fa9e4e5ea6d69b7967b767f6eba8",
+      "bytes": 6819534,
+      "mtime_utc": "2026-02-11T04:42:20.024096+00:00"
+    },
+    {
+      "relpath_from_datasets": "pcba/pcba.csv",
+      "sha256": "f11b346fdd696422d509d3e48e61e1f4de964dbf6dcc930a1dfed940b6ecb6e7",
+      "bytes": 115663189,
+      "mtime_utc": "2026-02-11T04:25:01.075081+00:00"
+    },
+    {
+      "relpath_from_datasets": "toxcast/toxcast_data.csv",
+      "sha256": "666d36476ff8f3208a618409022c1cc8cc7cd136e39b300320745509e0377db6",
+      "bytes": 10281259,
+      "mtime_utc": "2026-02-11T04:57:56.993482+00:00"
+    }
+  ]
+}

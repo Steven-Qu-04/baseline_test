@@ -1,0 +1,152 @@
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+from dataclasses import dataclass, asdict
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Iterable, List
+
+print(1/0)
+# 你当前项目里“主原始数据 CSV”的文件名（最稳妥：只哈希这些）
+DEFAULT_MAIN_CSVS = (
+    "Lipophilicity.csv",
+    "muv.csv",
+    "pcba.csv",
+    "toxcast_data.csv",
+)
+
+# 若你想 hash 所有 CSV，可用 --mode all；此时会排除一些常见派生文件
+EXCLUDE_SUBSTRINGS = (
+    "stats",
+    "summary",
+    "basic_info",
+    "integrity",
+    "check",
+    "data_check",
+)
+
+
+@dataclass(frozen=True)
+class FileRecord:
+    relpath_from_datasets: str  # e.g. "muv/muv.csv"
+    sha256: str
+    bytes: int
+    mtime_utc: str
+
+
+def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def utc_iso(ts: float) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
+def is_probably_derived_csv(name: str) -> bool:
+    lower = name.lower()
+    return any(s in lower for s in EXCLUDE_SUBSTRINGS)
+
+
+def discover_csvs(datasets_root: Path, mode: str, main_csv_names: Iterable[str]) -> List[Path]:
+    csvs = sorted(datasets_root.rglob("*.csv"))
+    if mode == "main":
+        name_set = {n.lower() for n in main_csv_names}
+        return [p for p in csvs if p.name.lower() in name_set]
+    if mode == "all":
+        return [p for p in csvs if not is_probably_derived_csv(p.name)]
+    raise ValueError(f"Unknown mode: {mode}")
+
+
+def project_root_from_script() -> Path:
+    """
+    Script path: <project>/datasets/data_tools/this_script.py
+    So project root is parents[2].
+    """
+    return Path(__file__).resolve().parents[2]
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "--mode",
+        choices=["main", "all"],
+        default="main",
+        help="main=只哈希主原始CSV(默认)；all=哈希除去常见派生文件外的所有CSV",
+    )
+    ap.add_argument(
+        "--main-csv",
+        action="append",
+        default=list(DEFAULT_MAIN_CSVS),
+        help="指定主CSV文件名（可重复）。默认包含项目当前4个原始CSV",
+    )
+    ap.add_argument(
+        "--out",
+        default=None,
+        help="manifest 输出路径。默认写到 datasets/data_tools/hash_manifest.json",
+    )
+    args = ap.parse_args()
+
+    proj_root = project_root_from_script()
+    datasets_root = (proj_root / "datasets").resolve()
+
+    if not datasets_root.exists():
+        raise SystemExit(f"datasets root not found: {datasets_root}")
+
+    out_path = Path(args.out).resolve() if args.out else (proj_root / "datasets" / "data_tools" / "hash_manifest.json").resolve()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    files = discover_csvs(datasets_root, args.mode, args.main_csv)
+
+    records: List[FileRecord] = []
+    for p in files:
+        st = p.stat()
+        records.append(
+            FileRecord(
+                relpath_from_datasets=str(p.relative_to(datasets_root)).replace("\\", "/"),
+                sha256=sha256_file(p),
+                bytes=st.st_size,
+                mtime_utc=utc_iso(st.st_mtime),
+            )
+        )
+
+    manifest = {
+        "algorithm": "sha256",
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "project_root": str(proj_root),
+        "datasets_root": str(datasets_root),
+        "mode": args.mode,
+        "included_main_csv_names": list(args.main_csv),
+        "file_count": len(records),
+        "files": [asdict(r) for r in records],
+    }
+
+    # atomic write
+    tmp = out_path.with_suffix(out_path.suffix + ".tmp")
+    tmp.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, out_path)
+
+    print(f"[OK] project_root : {proj_root}")
+    print(f"[OK] datasets_root : {datasets_root}")
+    print(f"[OK] wrote manifest: {out_path}")
+    print(f"[OK] files hashed : {len(records)}")
+    for r in records:
+        print(f" - {r.relpath_from_datasets}  {r.sha256[:12]}...  ({r.bytes} bytes)")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
